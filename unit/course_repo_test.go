@@ -23,7 +23,7 @@ func TestCourseRepository_CreateCourse(t *testing.T) {
 
 	course := &models.Course{
 		Name:         "Math 101",
-		Completeness: false,
+		Completeness: 0,
 	}
 
 	mock.ExpectQuery(`INSERT INTO "Moodle".courses`).

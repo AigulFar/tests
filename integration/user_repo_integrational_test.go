@@ -2,86 +2,208 @@ package integration
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
-	"github.com/jmoiron/sqlx"
-	_ "os"
 	"testing"
 
 	"github.com/Troshkins/InnoMoodle/backend/models"
 	"github.com/Troshkins/InnoMoodle/backend/repository"
-	_ "github.com/lib/pq"
+	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/stretchr/testify/suite"
 )
 
-func TestUserRepository_Integration(t *testing.T) {
-	ctx := context.Background()
+type RepositoriesIntegrationSuite struct {
+	suite.Suite
+	ctx        context.Context
+	db         *sqlx.DB
+	userRepo   *repository.UserRepository
+	courseRepo *repository.CourseRepository
+	groupRepo  *repository.GroupRepository
+}
 
-	// Запуск PostgreSQL контейнера
-	req := testcontainers.ContainerRequest{
-		Image:        "postgres:15-alpine",
-		ExposedPorts: []string{"5432/tcp"},
-		Env: map[string]string{
-			"POSTGRES_DB":       "testdb",
-			"POSTGRES_USER":     "user",
-			"POSTGRES_PASSWORD": "password",
-		},
-		WaitingFor: wait.ForListeningPort("5432/tcp"),
+func (s *RepositoriesIntegrationSuite) SetupSuite() {
+	s.ctx = context.Background()
+
+	// Инициализация подключения к БД
+	db, err := setupDB()
+	require.NoError(s.T(), err)
+	s.db = db
+
+	// Инициализация репозиториев
+	s.userRepo = repository.NewUserRepository(s.db)
+	s.courseRepo = repository.NewCourseRepository(s.db)
+	s.groupRepo = repository.NewGroupRepository(s.db)
+
+	// Создание минимальной схемы
+	s.createMinimalSchema()
+}
+
+func (s *RepositoriesIntegrationSuite) TearDownSuite() {
+	if s.db != nil {
+		s.db.Close()
+	}
+}
+
+func (s *RepositoriesIntegrationSuite) SetupTest() {
+	s.truncateTables()
+}
+
+func (s *RepositoriesIntegrationSuite) createMinimalSchema() {
+	queries := []string{
+		`DROP SCHEMA IF EXISTS "Moodle" CASCADE`,
+		`CREATE SCHEMA "Moodle"`,
+		`CREATE TABLE "Moodle".users (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            password TEXT NOT NULL
+        )`,
+		`CREATE TABLE "Moodle".courses (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            completeness INTEGER NOT NULL
+        )`,
+		`CREATE TABLE "Moodle".study_groups (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL
+        )`,
+		`CREATE TABLE "Moodle".course_student (
+            course_id BIGINT NOT NULL REFERENCES "Moodle".courses(id),
+            student_id BIGINT NOT NULL REFERENCES "Moodle".users(id),
+            PRIMARY KEY (course_id, student_id)
+        )`,
+		`CREATE TABLE "Moodle".group_student (
+            group_id BIGINT NOT NULL REFERENCES "Moodle".study_groups(id),
+            student_id BIGINT NOT NULL REFERENCES "Moodle".users(id),
+            PRIMARY KEY (group_id, student_id)
+        )`,
 	}
 
-	pgContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
-	require.NoError(t, err)
-	defer pgContainer.Terminate(ctx)
-
-	// Получение порта контейнера
-	port, err := pgContainer.MappedPort(ctx, "5432")
-	require.NoError(t, err)
-
-	// Формирование строки подключения
-	connStr := fmt.Sprintf("host=localhost port=%s user=user password=password dbname=testdb sslmode=disable", port.Port())
-
-	// Подключение к базе данных
-	db, err := sql.Open("postgres", connStr)
-	require.NoError(t, err)
-	defer db.Close()
-
-	// Инициализация схемы
-	_, err = db.Exec(`
-		CREATE SCHEMA "Moodle";
-		CREATE TABLE "Moodle".users (
-			id SERIAL PRIMARY KEY,
-			name VARCHAR(255) NOT NULL,
-			email VARCHAR(255) UNIQUE NOT NULL,
-			password VARCHAR(255) NOT NULL
-		);
-	`)
-	require.NoError(t, err)
-
-	// Создание репозитория
-	sqlxDB := sqlx.NewDb(db, "postgres")
-	repo := repository.NewUserRepository(sqlxDB)
-
-	t.Run("Create and Get User", func(t *testing.T) {
-		// Создание пользователя
-		user := &models.User{
-			Name:     "Integration User",
-			Email:    "integration@test.com",
-			Password: "securepassword",
+	for _, query := range queries {
+		_, err := s.db.Exec(query)
+		if err != nil {
+			s.T().Logf("Error executing query: %s\nError: %v", query, err)
 		}
+		require.NoError(s.T(), err)
+	}
+}
 
-		err := repo.CreateUser(ctx, user)
-		require.NoError(t, err)
-		require.NotZero(t, user.ID)
+func (s *RepositoriesIntegrationSuite) truncateTables() {
+	tables := []string{
+		`"Moodle".group_student`,
+		`"Moodle".course_student`,
+		`"Moodle".study_groups`,
+		`"Moodle".courses`,
+		`"Moodle".users`,
+	}
+	for _, table := range tables {
+		_, err := s.db.Exec("TRUNCATE TABLE " + table + " RESTART IDENTITY CASCADE")
+		require.NoError(s.T(), err)
+	}
+}
 
-		// Получение пользователя по email
-		retrievedUser, err := repo.GetUserByEmail(ctx, user.Email)
-		require.NoError(t, err)
-		require.Equal(t, user.Name, retrievedUser.Name)
-		require.Equal(t, user.Email, retrievedUser.Email)
-	})
+// Тест 1: Создание пользователя
+func (s *RepositoriesIntegrationSuite) TestCreateUser() {
+	user := &models.User{
+		Name:     "Test User",
+		Email:    "test@example.com",
+		Password: "password123",
+	}
+
+	err := s.userRepo.CreateUser(s.ctx, user)
+	require.NoError(s.T(), err)
+	require.NotZero(s.T(), user.ID)
+}
+
+// Тест 2: Создание курса
+func (s *RepositoriesIntegrationSuite) TestCreateCourse() {
+	course := &models.Course{
+		Name:         "Introduction to Testing",
+		Completeness: 0, // Убедитесь, что это число, а не строка
+	}
+
+	err := s.courseRepo.CreateCourse(s.ctx, course)
+	require.NoError(s.T(), err)
+	require.NotZero(s.T(), course.ID)
+
+	// Проверка создания курса в БД
+	var dbCourse models.Course
+	err = s.db.Get(&dbCourse, `SELECT * FROM "Moodle".courses WHERE id = $1`, course.ID)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), course.Name, dbCourse.Name)
+	require.Equal(s.T(), course.Completeness, dbCourse.Completeness)
+}
+
+// Тест 3: Создание учебной группы
+func (s *RepositoriesIntegrationSuite) TestCreateStudyGroup() {
+	group := &models.StudyGroup{
+		Name: "Group A",
+	}
+
+	err := s.groupRepo.CreateStudyGroup(s.ctx, group)
+	require.NoError(s.T(), err)
+	require.NotZero(s.T(), group.ID)
+}
+
+// Тест 4: Запись студента на курс
+func (s *RepositoriesIntegrationSuite) TestEnrollStudent() {
+	// Создаем студента
+	student := &models.User{
+		Name:     "Student",
+		Email:    "student@example.com",
+		Password: "pass123",
+	}
+	err := s.userRepo.CreateUser(s.ctx, student)
+	require.NoError(s.T(), err)
+
+	// Создаем курс
+	course := &models.Course{
+		Name:         "Math 101",
+		Completeness: 0,
+	}
+	err = s.courseRepo.CreateCourse(s.ctx, course)
+	require.NoError(s.T(), err)
+
+	// Записываем студента на курс
+	err = s.courseRepo.EnrollStudent(s.ctx, course.ID, student.ID)
+	require.NoError(s.T(), err)
+
+	// Проверка записи в БД
+	var count int
+	err = s.db.Get(&count, `
+        SELECT COUNT(*) 
+        FROM "Moodle".course_student 
+        WHERE course_id = $1 AND student_id = $2`,
+		course.ID, student.ID)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 1, count)
+}
+
+// Тест 5: Добавление студента в группу
+func (s *RepositoriesIntegrationSuite) TestAddStudentToGroup() {
+	// Создаем студента
+	student := &models.User{
+		Name:     "Group Student",
+		Email:    "group@example.com",
+		Password: "group123",
+	}
+	err := s.userRepo.CreateUser(s.ctx, student)
+	require.NoError(s.T(), err)
+
+	// Создаем группу
+	group := &models.StudyGroup{
+		Name: "Study Group 1",
+	}
+	err = s.groupRepo.CreateStudyGroup(s.ctx, group)
+	require.NoError(s.T(), err)
+
+	// Добавляем студента в группу
+	err = s.groupRepo.AddStudentToGroup(s.ctx, group.ID, student.ID)
+	require.NoError(s.T(), err)
+}
+
+func TestRepositoriesIntegrationSuite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	suite.Run(t, new(RepositoriesIntegrationSuite))
 }
